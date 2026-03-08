@@ -157,15 +157,11 @@ export default function App() {
 
   const callClaude = async (fileContents, context = "") => {
     const userMessage = `Here are my project files${context}:\n\n${fileContents.join("\n\n")}\n\nPlease analyze these files and generate the project metadata and README.`;
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetch("/api/generate", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-allow-browser": "true",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        apiKey,
         model: MODEL,
         max_tokens: 4096,
         system: SYSTEM_PROMPT,
