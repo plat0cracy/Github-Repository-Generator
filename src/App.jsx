@@ -131,6 +131,12 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState("readme");
+  const [apiKey, setApiKey] = useState("");
+  const [mode, setMode] = useState("files");
+  const [repoUrl, setRepoUrl] = useState("");
+  const [githubToken, setGithubToken] = useState("");
+  const [pushing, setPushing] = useState(false);
+  const [pushResult, setPushResult] = useState(null);
 
   const readableExtensions = [
     "js","jsx","ts","tsx","py","json","md","txt","html","css","java","go",
@@ -149,49 +155,140 @@ export default function App() {
 
   const removeFile = (name) => setFiles(prev => prev.filter(f => f.name !== name));
 
+  const callClaude = async (fileContents, context = "") => {
+    const userMessage = `Here are my project files${context}:\n\n${fileContents.join("\n\n")}\n\nPlease analyze these files and generate the project metadata and README.`;
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-allow-browser": "true",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMessage }],
+      }),
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+    const raw = data.content.map(b => b.text || "").join("");
+    const clean = raw.replace(/```json|```/g, "").trim();
+    return JSON.parse(clean);
+  };
+
+  const parseGitHubUrl = (url) => {
+    const match = url.match(/github\.com\/([^/]+)\/([^/?#]+)/);
+    if (!match) return null;
+    return { owner: match[1], repo: match[2].replace(/\.git$/, "") };
+  };
+
   const generate = async () => {
-    if (!files.length) return;
+    if (mode === "files" && !files.length) return;
+    if (mode === "repo" && !repoUrl) return;
     setLoading(true);
     setError(null);
     setResult(null);
+    setPushResult(null);
 
     try {
-      const fileContents = await Promise.all(
-        files.map(async (file) => {
-          const ext = file.name.split(".").pop().toLowerCase();
-          if (!readableExtensions.includes(ext)) {
-            return `--- ${file.name} (binary/unsupported, size: ${(file.size / 1024).toFixed(1)}KB) ---`;
-          }
-          const text = await file.text();
-          const truncated = text.length > 3000 ? text.slice(0, 3000) + "\n... (truncated)" : text;
-          return `--- ${file.name} ---\n${truncated}`;
-        })
-      );
+      let fileContents = [];
+      let repoInfo = null;
 
-      const userMessage = `Here are my project files:\n\n${fileContents.join("\n\n")}\n\nPlease analyze these files and generate the project metadata and README.`;
+      if (mode === "files") {
+        fileContents = await Promise.all(
+          files.map(async (file) => {
+            const ext = file.name.split(".").pop().toLowerCase();
+            if (!readableExtensions.includes(ext)) {
+              return `--- ${file.name} (binary/unsupported, size: ${(file.size / 1024).toFixed(1)}KB) ---`;
+            }
+            const text = await file.text();
+            const truncated = text.length > 3000 ? text.slice(0, 3000) + "\n... (truncated)" : text;
+            return `--- ${file.name} ---\n${truncated}`;
+          })
+        );
+      } else {
+        repoInfo = parseGitHubUrl(repoUrl);
+        if (!repoInfo) throw new Error("Invalid GitHub URL");
+        const ghHeaders = { "Accept": "application/vnd.github+json" };
+        if (githubToken) ghHeaders["Authorization"] = `Bearer ${githubToken}`;
+        const treeRes = await fetch(
+          `https://api.github.com/repos/${repoInfo.owner}/${repoInfo.repo}/git/trees/HEAD?recursive=1`,
+          { headers: ghHeaders }
+        );
+        const treeData = await treeRes.json();
+        if (!treeRes.ok) throw new Error(treeData.message || "Failed to fetch repository");
+        const filesToFetch = treeData.tree
+          .filter(f => f.type === "blob" && (f.size || 0) < 100000)
+          .filter(f => readableExtensions.includes(f.path.split(".").pop().toLowerCase()))
+          .slice(0, 25);
+        fileContents = await Promise.all(
+          filesToFetch.map(async (file) => {
+            const res = await fetch(
+              `https://api.github.com/repos/${repoInfo.owner}/${repoInfo.repo}/contents/${file.path}`,
+              { headers: ghHeaders }
+            );
+            const fileData = await res.json();
+            if (fileData.content) {
+              const text = atob(fileData.content.replace(/\n/g, ""));
+              const truncated = text.length > 3000 ? text.slice(0, 3000) + "\n... (truncated)" : text;
+              return `--- ${file.path} ---\n${truncated}`;
+            }
+            return `--- ${file.path} (unreadable) ---`;
+          })
+        );
+      }
 
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: MODEL,
-          max_tokens: 1000,
-          system: SYSTEM_PROMPT,
-          messages: [{ role: "user", content: userMessage }],
-        }),
-      });
-
-      const data = await response.json();
-      const raw = data.content.map(b => b.text || "").join("");
-      const clean = raw.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(clean);
-      setResult(parsed);
+      const parsed = await callClaude(fileContents, mode === "repo" ? ` from ${repoUrl}` : "");
+      setResult({ ...parsed, _repoInfo: repoInfo });
       setActiveTab("readme");
     } catch (e) {
-      setError("Failed to generate. Make sure your files are readable text files and try again.");
+      setError(e.message || "Failed to generate. Check your files and API key, then try again.");
       console.error(e);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const pushToGitHub = async () => {
+    if (!result?._repoInfo || !githubToken) return;
+    const { owner, repo } = result._repoInfo;
+    setPushing(true);
+    setPushResult(null);
+    try {
+      const headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": `Bearer ${githubToken}`,
+        "Content-Type": "application/json",
+      };
+      const checkRes = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/contents/README.md`,
+        { headers }
+      );
+      const body = {
+        message: "Update README.md via GitHub Repo Generator",
+        content: btoa(unescape(encodeURIComponent(result.readme))),
+      };
+      if (checkRes.ok) {
+        const existing = await checkRes.json();
+        body.sha = existing.sha;
+      }
+      const pushRes = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/contents/README.md`,
+        { method: "PUT", headers, body: JSON.stringify(body) }
+      );
+      if (pushRes.ok) {
+        setPushResult({ success: true, message: `README.md pushed to ${owner}/${repo} successfully!` });
+      } else {
+        const err = await pushRes.json();
+        throw new Error(err.message);
+      }
+    } catch (e) {
+      setPushResult({ success: false, message: e.message });
+    } finally {
+      setPushing(false);
     }
   };
 
@@ -224,13 +321,96 @@ export default function App() {
           </p>
         </div>
 
-        {/* Uploader */}
-        <div style={{ marginBottom: "24px" }}>
-          <FileUploader onFiles={handleFiles} />
+        {/* API Key */}
+        <div style={{ marginBottom: "16px" }}>
+          <input
+            type="password"
+            placeholder="Enter your Anthropic API key (sk-ant-...)"
+            value={apiKey}
+            onChange={e => setApiKey(e.target.value)}
+            style={{
+              width: "100%",
+              padding: "12px 16px",
+              background: "rgba(15,23,42,0.8)",
+              border: "1px solid #334155",
+              borderRadius: "10px",
+              color: "#e2e8f0",
+              fontSize: "14px",
+              boxSizing: "border-box",
+              outline: "none",
+            }}
+          />
         </div>
 
+        {/* Mode Toggle */}
+        <div style={{ display: "flex", gap: "8px", marginBottom: "24px" }}>
+          {["files", "repo"].map(m => (
+            <button key={m} onClick={() => { setMode(m); setResult(null); setError(null); setPushResult(null); }} style={{
+              flex: 1,
+              padding: "10px",
+              background: mode === m ? "rgba(16,185,129,0.15)" : "rgba(15,23,42,0.6)",
+              border: `1px solid ${mode === m ? "#10b981" : "#334155"}`,
+              borderRadius: "8px",
+              color: mode === m ? "#6ee7b7" : "#64748b",
+              cursor: "pointer",
+              fontSize: "14px",
+              fontWeight: "600",
+              transition: "all 0.2s",
+            }}>
+              {m === "files" ? "📁 Upload Files" : "🔗 GitHub Repository"}
+            </button>
+          ))}
+        </div>
+
+        {/* Uploader or Repo Input */}
+        {mode === "files" ? (
+          <div style={{ marginBottom: "24px" }}>
+            <FileUploader onFiles={handleFiles} />
+          </div>
+        ) : (
+          <div style={{ marginBottom: "24px", display: "flex", flexDirection: "column", gap: "12px" }}>
+            <input
+              type="text"
+              placeholder="GitHub repo URL (e.g. https://github.com/owner/repo)"
+              value={repoUrl}
+              onChange={e => setRepoUrl(e.target.value)}
+              style={{
+                width: "100%",
+                padding: "12px 16px",
+                background: "rgba(15,23,42,0.8)",
+                border: "1px solid #334155",
+                borderRadius: "10px",
+                color: "#e2e8f0",
+                fontSize: "14px",
+                boxSizing: "border-box",
+                outline: "none",
+              }}
+            />
+            <input
+              type="password"
+              placeholder="GitHub Personal Access Token (required to push changes)"
+              value={githubToken}
+              onChange={e => setGithubToken(e.target.value)}
+              style={{
+                width: "100%",
+                padding: "12px 16px",
+                background: "rgba(15,23,42,0.8)",
+                border: "1px solid #334155",
+                borderRadius: "10px",
+                color: "#e2e8f0",
+                fontSize: "14px",
+                boxSizing: "border-box",
+                outline: "none",
+              }}
+            />
+            <p style={{ color: "#475569", fontSize: "12px", margin: 0 }}>
+              Token needs <strong style={{ color: "#64748b" }}>repo</strong> scope. Generate at GitHub → Settings → Developer Settings → Personal Access Tokens.
+            </p>
+          </div>
+        )}
+
         {/* File List */}
-        {files.length > 0 && (
+        {mode === "files" && files.length > 0 && (
           <div style={{
             background: "rgba(15,23,42,0.8)",
             border: "1px solid #1e293b",
@@ -263,24 +443,26 @@ export default function App() {
         {/* Generate Button */}
         <button
           onClick={generate}
-          disabled={!files.length || loading}
+          disabled={(mode === "files" ? !files.length : !repoUrl) || loading}
           style={{
             width: "100%",
             padding: "14px",
-            background: files.length && !loading
+            background: (mode === "files" ? files.length : repoUrl) && !loading
               ? "linear-gradient(135deg, #10b981, #3b82f6)"
               : "#1e293b",
-            color: files.length && !loading ? "white" : "#475569",
+            color: (mode === "files" ? files.length : repoUrl) && !loading ? "white" : "#475569",
             border: "none",
             borderRadius: "10px",
             fontSize: "16px",
             fontWeight: "700",
-            cursor: files.length && !loading ? "pointer" : "not-allowed",
+            cursor: (mode === "files" ? files.length : repoUrl) && !loading ? "pointer" : "not-allowed",
             marginBottom: "32px",
             transition: "all 0.2s",
           }}
         >
-          {loading ? "⚙️ Analyzing your project..." : "✨ Generate GitHub Assets"}
+          {loading
+            ? (mode === "repo" ? "⚙️ Fetching & analyzing repository..." : "⚙️ Analyzing your project...")
+            : "✨ Generate GitHub Assets"}
         </button>
 
         {error && (
@@ -389,6 +571,48 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            {/* Push to GitHub */}
+            {result._repoInfo && (
+              <div style={{ marginTop: "16px" }}>
+                <button
+                  onClick={pushToGitHub}
+                  disabled={pushing || !githubToken}
+                  style={{
+                    width: "100%",
+                    padding: "12px",
+                    background: pushing || !githubToken ? "#1e293b" : "linear-gradient(135deg, #7c3aed, #3b82f6)",
+                    color: pushing || !githubToken ? "#475569" : "white",
+                    border: "none",
+                    borderRadius: "10px",
+                    fontSize: "15px",
+                    fontWeight: "700",
+                    cursor: pushing || !githubToken ? "not-allowed" : "pointer",
+                    transition: "all 0.2s",
+                  }}
+                >
+                  {pushing ? "⚙️ Pushing to repository..." : "🚀 Push README.md to Repository"}
+                </button>
+                {!githubToken && (
+                  <p style={{ color: "#475569", fontSize: "12px", textAlign: "center", marginTop: "8px" }}>
+                    Enter a GitHub token above to push changes
+                  </p>
+                )}
+                {pushResult && (
+                  <div style={{
+                    marginTop: "12px",
+                    padding: "12px 16px",
+                    borderRadius: "8px",
+                    background: pushResult.success ? "rgba(16,185,129,0.1)" : "rgba(239,68,68,0.1)",
+                    border: `1px solid ${pushResult.success ? "#065f46" : "#7f1d1d"}`,
+                    color: pushResult.success ? "#6ee7b7" : "#fca5a5",
+                    fontSize: "14px",
+                  }}>
+                    {pushResult.success ? "✓" : "⚠️"} {pushResult.message}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
